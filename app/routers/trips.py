@@ -1,13 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+import uuid
 
 from app.database import get_db
 from app.models.rider import Rider
-from app.models.trip import Trip
-from app.schemas.trip import RideRequest, TripOut
+from app.models.driver import Driver
+from app.models.trip import Trip, TripStatus
+from app.schemas.trip import RideRequest, TripOut, TripStatusUpdate
 from app.core.matching import find_best_available_driver
+from app.core.geo_utils import get_driver_location, haversine_distance_km
+from app.core.fare_calculator import calculate_fare
+from app.core.eta import calculate_eta_minutes
+from app.core.trip_state_machine import is_valid_transition
 from app.websocket.manager import driver_manager, rider_manager
-from app.websocket.events import ride_assigned_event, driver_found_event
+from app.websocket.events import ride_assigned_event, driver_found_event, trip_status_updated_event
 
 router = APIRouter(prefix="/rides", tags=["trips"])
 
@@ -39,11 +45,32 @@ async def request_ride(ride_in: RideRequest, db: Session = Depends(get_db)):
     if not driver:
         raise HTTPException(status_code=404, detail="No available drivers nearby")
 
+    # Read the driver's CURRENT position from Redis (never Postgres —
+    # Postgres has no location data, by design since Phase 1) to compute
+    # a straight-line distance from driver to pickup point.
+    driver_location = get_driver_location(str(driver.id))
+    if driver_location:
+        distance_km = haversine_distance_km(
+            driver_location["latitude"], driver_location["longitude"],
+            ride_in.pickup_latitude, ride_in.pickup_longitude,
+        )
+    else:
+        # Extremely unlikely here (find_best_available_driver only
+        # returns drivers GEOSEARCH found, meaning they have a location),
+        # but defensive fallback avoids a crash if Redis data vanished
+        # between the search and this read.
+        distance_km = 0.0
+
+    estimated_fare = calculate_fare(distance_km)
+    eta_minutes = calculate_eta_minutes(distance_km)
+
     trip = Trip(
         rider_id=rider.id,
         driver_id=driver.id,
         pickup_latitude=ride_in.pickup_latitude,
         pickup_longitude=ride_in.pickup_longitude,
+        estimated_fare=estimated_fare,
+        eta_minutes=eta_minutes,
     )
     db.add(trip)
     db.commit()
@@ -57,7 +84,98 @@ async def request_ride(ride_in: RideRequest, db: Session = Depends(get_db)):
     # Notify the rider a driver has been found
     await rider_manager.send_to(
         str(rider.id),
-        driver_found_event(trip.id, driver.id),
+        driver_found_event(trip.id, driver.id, trip.estimated_fare, trip.eta_minutes),
     )
 
     return trip
+
+
+@router.patch("/{trip_id}/status", response_model=TripOut)
+async def update_trip_status(trip_id: uuid.UUID, update: TripStatusUpdate, db: Session = Depends(get_db)):
+    """
+    Transitions a trip to a new status, enforcing the state machine —
+    e.g. a COMPLETED trip can never move to any other status, and a
+    REQUESTED trip can't jump straight to COMPLETED without going
+    through ONGOING first.
+
+    Side effect: when a trip becomes ONGOING, the driver is now busy
+    with this specific rider, so is_available flips to False — they
+    should stop appearing in future GEOSEARCH matches for other riders.
+    When a trip becomes COMPLETED or CANCELLED, the driver is free again,
+    so is_available flips back to True.
+    """
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    if not is_valid_transition(trip.status, update.new_status):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot transition trip from {trip.status.value} to {update.new_status.value}",
+        )
+
+    trip.status = update.new_status
+
+    driver = db.query(Driver).filter(Driver.id == trip.driver_id).first()
+    if driver:
+        if update.new_status == TripStatus.ONGOING:
+            driver.is_available = False
+        elif update.new_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
+            driver.is_available = True
+
+    db.commit()
+    db.refresh(trip)
+
+    event = trip_status_updated_event(trip.id, trip.status.value)
+    await driver_manager.send_to(str(trip.driver_id), event)
+    await rider_manager.send_to(str(trip.rider_id), event)
+
+    return trip
+
+
+@router.get("/{trip_id}", response_model=TripOut)
+def get_trip(trip_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Fallback lookup path for a single trip's current state — useful if a
+    rider/driver's app wasn't connected via WebSocket when a push
+    happened (pushes are best-effort, established in Phase 3), so they
+    can just ask directly instead of waiting for one that already passed.
+    """
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    return trip
+
+
+@router.get("/history/{rider_id}", response_model=list[TripOut])
+def get_trip_history(rider_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    All past trips for a rider, most recent first. Kept unpaginated for
+    now — fine at small scale, but a rider with thousands of trips would
+    need cursor-based pagination here in a real system, not offset-based
+    (offset pagination degrades badly at large offsets since the database
+    still has to scan and discard all skipped rows).
+    """
+    trips = (
+        db.query(Trip)
+        .filter(Trip.rider_id == rider_id)
+        .order_by(Trip.created_at.desc())
+        .all()
+    )
+    return trips
+
+
+def find_active_trip_for_driver(db: Session, driver_id: str):
+    """
+    Looks up whether this driver currently has a trip in ONGOING status.
+
+    Notice this doesn't need a separate rider<->driver pairing table —
+    Trip already IS that pairing, with a status field telling us whether
+    it's currently active. This is the same table built in Phase 2,
+    reused here for a new purpose.
+    """
+    return (
+        db.query(Trip)
+        .filter(Trip.driver_id == driver_id, Trip.status == TripStatus.ONGOING)
+        .first()
+    )
