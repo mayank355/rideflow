@@ -35,3 +35,40 @@ def get_driver_location(driver_id: str):
         return None
     longitude, latitude = result[0]
     return {"longitude": float(longitude), "latitude": float(latitude)}
+
+
+def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Straight-line ("as the crow flies") distance between two lat/lng
+    points, in kilometers, accounting for Earth's curvature.
+
+    IMPORTANT LIMITATION, stated explicitly: this is NOT actual driving
+    distance. Two points 2km apart in a straight line might require 5km
+    of actual road travel due to one-ways, rivers, highways, or how city
+    blocks are laid out. Production systems (Uber, etc.) use a routing
+    engine with a real road-network graph (e.g. OSRM) to get true driving
+    distance and account for live traffic — a fundamentally heavier
+    system involving external routing calls and a road graph database.
+
+    We use Haversine here because it's fast, needs zero external
+    dependencies, and is a reasonable approximation for a project at
+    this stage — but the gap between this and real driving distance is
+    real and worth naming, not hiding.
+    """
+    import math
+
+    R = 6371.0  # Earth's radius in km
+
+    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
+    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
+
+    d_lat = lat2_rad - lat1_rad
+    d_lon = lon2_rad - lon1_rad
+
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(d_lon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c

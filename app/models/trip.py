@@ -28,6 +28,9 @@ class Trip(Base):
     pickup_latitude = Column(Float, nullable=False)
     pickup_longitude = Column(Float, nullable=False)
 
+    estimated_fare = Column(Float, nullable=True)
+    eta_minutes = Column(Float, nullable=True)
+
     status = Column(Enum(TripStatus), default=TripStatus.REQUESTED, nullable=False)
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

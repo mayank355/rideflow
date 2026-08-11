@@ -17,8 +17,14 @@ class TripOut(BaseModel):
     driver_id: uuid.UUID
     pickup_latitude: float
     pickup_longitude: float
+    estimated_fare: float
+    eta_minutes: float
     status: TripStatus
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class TripStatusUpdate(BaseModel):
+    new_status: TripStatus
