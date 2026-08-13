@@ -6,7 +6,8 @@ from app.models.trip import TripStatus
 # with no valid transitions out of them at all.
 VALID_TRANSITIONS = {
     TripStatus.REQUESTED: {TripStatus.ONGOING, TripStatus.CANCELLED},
-    TripStatus.ONGOING: {TripStatus.COMPLETED, TripStatus.CANCELLED},
+    TripStatus.ONGOING: {TripStatus.PAYMENT_PENDING, TripStatus.CANCELLED},
+    TripStatus.PAYMENT_PENDING: {TripStatus.COMPLETED},
     TripStatus.COMPLETED: set(),   # terminal — no transitions out
     TripStatus.CANCELLED: set(),   # terminal — no transitions out
 }

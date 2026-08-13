@@ -3,8 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.driver import Driver
+from app.models.trip_location_log import TripLocationLog
 from app.schemas.driver import DriverCreate, DriverOut, LocationUpdate
 from app.core.geo_utils import update_driver_location
+from app.core.location_throttle import should_push_location
 from app.routers.trips import find_active_trip_for_driver
 from app.websocket.manager import rider_manager
 from app.websocket.events import driver_location_update_event
@@ -58,10 +60,24 @@ async def report_location(driver_id: str, location: LocationUpdate, db: Session 
 
     active_trip = find_active_trip_for_driver(db, driver_id)
     if active_trip:
-        await rider_manager.send_to(
-            str(active_trip.rider_id),
-            driver_location_update_event(active_trip.id, location.latitude, location.longitude),
-        )
+        # Durable route log — every ping during an active trip, kept for
+        # replay/history. Separate concern from the throttled WebSocket
+        # push below: we NEVER throttle what we persist, only what we
+        # push live, since a sparse route history would be a real loss
+        # later (dispute resolution, analytics) even if frequent live
+        # pushes aren't needed for the rider's screen.
+        db.add(TripLocationLog(
+            trip_id=active_trip.id,
+            latitude=location.latitude,
+            longitude=location.longitude,
+        ))
+        db.commit()
+
+        if should_push_location(str(active_trip.id), location.latitude, location.longitude):
+            await rider_manager.send_to(
+                str(active_trip.rider_id),
+                driver_location_update_event(active_trip.id, location.latitude, location.longitude),
+            )
 
     return {"status": "location updated"}
 

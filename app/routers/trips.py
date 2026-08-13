@@ -6,12 +6,14 @@ from app.database import get_db
 from app.models.rider import Rider
 from app.models.driver import Driver
 from app.models.trip import Trip, TripStatus
+from app.models.trip_location_log import TripLocationLog
 from app.schemas.trip import RideRequest, TripOut, TripStatusUpdate
 from app.core.matching import find_best_available_driver
 from app.core.geo_utils import get_driver_location, haversine_distance_km
 from app.core.fare_calculator import calculate_fare
 from app.core.eta import calculate_eta_minutes
 from app.core.trip_state_machine import is_valid_transition
+from app.core.location_throttle import clear_trip_tracking
 from app.websocket.manager import driver_manager, rider_manager
 from app.websocket.events import ride_assigned_event, driver_found_event, trip_status_updated_event
 
@@ -96,13 +98,14 @@ async def update_trip_status(trip_id: uuid.UUID, update: TripStatusUpdate, db: S
     Transitions a trip to a new status, enforcing the state machine —
     e.g. a COMPLETED trip can never move to any other status, and a
     REQUESTED trip can't jump straight to COMPLETED without going
-    through ONGOING first.
+    through ONGOING and PAYMENT_PENDING first.
 
-    Side effect: when a trip becomes ONGOING, the driver is now busy
-    with this specific rider, so is_available flips to False — they
-    should stop appearing in future GEOSEARCH matches for other riders.
-    When a trip becomes COMPLETED or CANCELLED, the driver is free again,
-    so is_available flips back to True.
+    Side effect: when a trip becomes ONGOING, the driver is busy with
+    this specific rider, so is_available flips to False. The driver
+    STAYS unavailable through PAYMENT_PENDING (the ride physically ended,
+    but payment hasn't settled yet — mirrors real ride-hailing apps,
+    where a driver isn't freed until payment is confirmed, not the
+    instant the ride ends). Only COMPLETED or CANCELLED frees the driver.
     """
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
@@ -122,6 +125,7 @@ async def update_trip_status(trip_id: uuid.UUID, update: TripStatusUpdate, db: S
             driver.is_available = False
         elif update.new_status in (TripStatus.COMPLETED, TripStatus.CANCELLED):
             driver.is_available = True
+            clear_trip_tracking(str(trip.id))
 
     db.commit()
     db.refresh(trip)
@@ -163,6 +167,29 @@ def get_trip_history(rider_id: uuid.UUID, db: Session = Depends(get_db)):
         .all()
     )
     return trips
+
+
+@router.get("/{trip_id}/route")
+def get_trip_route(trip_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Full recorded path for a trip, in chronological order — the data
+    needed to draw/replay the actual route driven, distinct from the
+    single current position Redis holds while a trip is live.
+    """
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    points = (
+        db.query(TripLocationLog)
+        .filter(TripLocationLog.trip_id == trip_id)
+        .order_by(TripLocationLog.recorded_at.asc())
+        .all()
+    )
+    return [
+        {"latitude": p.latitude, "longitude": p.longitude, "recorded_at": p.recorded_at}
+        for p in points
+    ]
 
 
 def find_active_trip_for_driver(db: Session, driver_id: str):

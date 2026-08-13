@@ -9,9 +9,10 @@ from app.database import Base
 
 
 class TripStatus(str, enum.Enum):
-    REQUESTED = "requested"   # driver matched, not yet picked up
-    ONGOING = "ongoing"       # picked up, trip in progress (Phase 3+)
-    COMPLETED = "completed"   # trip finished (Phase 3+)
+    REQUESTED = "requested"              # driver matched, not yet picked up
+    ONGOING = "ongoing"                  # picked up, trip in progress
+    PAYMENT_PENDING = "payment_pending"  # ride physically ended, payment not yet settled
+    COMPLETED = "completed"              # payment settled, trip fully done
     CANCELLED = "cancelled"
 
 
