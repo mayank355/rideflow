@@ -7,6 +7,7 @@ from app.database import Base, engine as db_engine
 from app.models.driver import Driver  # noqa: F401 — import ensures table is registered with Base
 from app.models.rider import Rider  # noqa: F401
 from app.models.trip import Trip  # noqa: F401
+from app.models.trip_location_log import TripLocationLog  # noqa: F401
 from app.routers import drivers, riders, trips
 from app.websocket import routes as ws_routes
 
@@ -18,10 +19,12 @@ REDIS_URL = os.getenv("REDIS_URL")
 engine = create_engine(DATABASE_URL)
 redis_client = redis.from_url(REDIS_URL)
 
-# Creates the 'drivers' table if it doesn't exist yet.
-# This is create_all() — fine for now, but the moment we need to ALTER
-# an existing table without losing data, we switch to Alembic migrations.
-Base.metadata.create_all(bind=db_engine)
+# Schema is now managed by Alembic migrations (run `alembic upgrade head`
+# before starting the app, or via docker-compose entrypoint), NOT
+# create_all(). create_all() can only create missing tables — it cannot
+# alter existing ones, which is exactly the limitation that forced manual
+# table drops in earlier phases. Alembic tracks incremental changes
+# safely, including on tables with real data.
 
 app.include_router(drivers.router)
 app.include_router(riders.router)

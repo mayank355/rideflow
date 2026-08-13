@@ -17,9 +17,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Now copy the rest of the application code
 COPY ./app ./app
+COPY ./alembic ./alembic
+COPY alembic.ini .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 # Expose the port uvicorn will run on
 EXPOSE 8000
 
-# Command to run when the container starts
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Runs migrations, then starts uvicorn — see entrypoint.sh
+CMD ["./entrypoint.sh"]
