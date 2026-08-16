@@ -14,10 +14,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("drivers", sa.Column("hashed_password", sa.String(), nullable=True))
-    op.add_column("riders", sa.Column("hashed_password", sa.String(), nullable=True))
+    # Idempotent: safe to re-run if a prior deploy partially applied this migration
+    op.execute("ALTER TABLE drivers ADD COLUMN IF NOT EXISTS hashed_password VARCHAR")
+    op.execute("ALTER TABLE riders ADD COLUMN IF NOT EXISTS hashed_password VARCHAR")
 
 
 def downgrade() -> None:
-    op.drop_column("riders", "hashed_password")
-    op.drop_column("drivers", "hashed_password")
+    op.execute("ALTER TABLE riders DROP COLUMN IF EXISTS hashed_password")
+    op.execute("ALTER TABLE drivers DROP COLUMN IF EXISTS hashed_password")
