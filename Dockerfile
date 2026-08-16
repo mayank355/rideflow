@@ -20,6 +20,8 @@ COPY ./app ./app
 COPY ./alembic ./alembic
 COPY alembic.ini .
 COPY entrypoint.sh .
+COPY ./tests ./tests
+COPY pytest.ini .
 RUN chmod +x entrypoint.sh
 
 # Expose the port uvicorn will run on
