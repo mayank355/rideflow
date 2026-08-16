@@ -21,48 +21,69 @@ branch_labels = None
 depends_on = None
 
 
+def table_exists(table_name):
+    """Check if a table exists in the current database."""
+    inspector = sa.inspect(op.get_bind())
+    return table_name in inspector.get_table_names()
+
+
+def enum_exists(enum_name):
+    """Check if an enum type exists in the current database."""
+    bind = op.get_bind()
+    result = bind.execute(sa.text(
+        "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = :name)"
+    ), {"name": enum_name})
+    return result.scalar()
+
+
 def upgrade() -> None:
-    op.create_table(
-        "drivers",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("name", sa.String(), nullable=False),
-        sa.Column("phone_number", sa.String(), nullable=False, unique=True),
-        sa.Column("vehicle_number", sa.String(), nullable=False, unique=True),
-        sa.Column("vehicle_type", sa.String(), nullable=False),
-        sa.Column("is_available", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_drivers_id", "drivers", ["id"])
-    op.create_index("ix_drivers_phone_number", "drivers", ["phone_number"])
+    # Create tables only if they don't already exist
+    if not table_exists("drivers"):
+        op.create_table(
+            "drivers",
+            sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column("name", sa.String(), nullable=False),
+            sa.Column("phone_number", sa.String(), nullable=False, unique=True),
+            sa.Column("vehicle_number", sa.String(), nullable=False, unique=True),
+            sa.Column("vehicle_type", sa.String(), nullable=False),
+            sa.Column("is_available", sa.Boolean(), nullable=False, server_default=sa.false()),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        )
+        op.create_index("ix_drivers_id", "drivers", ["id"])
+        op.create_index("ix_drivers_phone_number", "drivers", ["phone_number"])
 
-    op.create_table(
-        "riders",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("name", sa.String(), nullable=False),
-        sa.Column("phone_number", sa.String(), nullable=False, unique=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_riders_id", "riders", ["id"])
-    op.create_index("ix_riders_phone_number", "riders", ["phone_number"])
+    if not table_exists("riders"):
+        op.create_table(
+            "riders",
+            sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column("name", sa.String(), nullable=False),
+            sa.Column("phone_number", sa.String(), nullable=False, unique=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        )
+        op.create_index("ix_riders_id", "riders", ["id"])
+        op.create_index("ix_riders_phone_number", "riders", ["phone_number"])
 
-    trip_status_enum = postgresql.ENUM(
-        "requested", "ongoing", "completed", "cancelled", name="tripstatus"
-    )
-    trip_status_enum.create(op.get_bind(), checkfirst=True)
+    # Create enum only if it doesn't exist
+    if not enum_exists("tripstatus"):
+        trip_status_enum = postgresql.ENUM(
+            "requested", "ongoing", "completed", "cancelled", name="tripstatus"
+        )
+        trip_status_enum.create(op.get_bind(), checkfirst=False)
 
-    op.create_table(
-        "trips",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("rider_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("riders.id"), nullable=False),
-        sa.Column("driver_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("drivers.id"), nullable=False),
-        sa.Column("pickup_latitude", sa.Float(), nullable=False),
-        sa.Column("pickup_longitude", sa.Float(), nullable=False),
-        sa.Column("estimated_fare", sa.Float(), nullable=True),
-        sa.Column("eta_minutes", sa.Float(), nullable=True),
-        sa.Column("status", trip_status_enum, nullable=False, server_default="requested"),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_trips_id", "trips", ["id"])
+    if not table_exists("trips"):
+        op.create_table(
+            "trips",
+            sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column("rider_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("riders.id"), nullable=False),
+            sa.Column("driver_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("drivers.id"), nullable=False),
+            sa.Column("pickup_latitude", sa.Float(), nullable=False),
+            sa.Column("pickup_longitude", sa.Float(), nullable=False),
+            sa.Column("estimated_fare", sa.Float(), nullable=True),
+            sa.Column("eta_minutes", sa.Float(), nullable=True),
+            sa.Column("status", postgresql.ENUM("requested", "ongoing", "completed", "cancelled", name="tripstatus"), nullable=False, server_default="requested"),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        )
+        op.create_index("ix_trips_id", "trips", ["id"])
 
 
 def downgrade() -> None:
@@ -74,3 +95,4 @@ def downgrade() -> None:
     op.drop_index("ix_drivers_phone_number", table_name="drivers")
     op.drop_index("ix_drivers_id", table_name="drivers")
     op.drop_table("drivers")
+
