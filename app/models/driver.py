@@ -22,6 +22,11 @@ class Driver(Base):
     # Status — changes occasionally (online/offline toggle), NOT every few seconds
     is_available = Column(Boolean, default=False, nullable=False)
 
+    # Auth — bcrypt hash, never the plain password. Nullable=False once
+    # signup replaces open registration; kept nullable here only to avoid
+    # breaking already-existing rows created before auth existed.
+    hashed_password = Column(String, nullable=True)
+
     # Metadata
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 

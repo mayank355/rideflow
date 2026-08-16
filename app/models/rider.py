@@ -13,6 +13,7 @@ class Rider(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     name = Column(String, nullable=False)
     phone_number = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # No location column here either — a rider's pickup point is given

@@ -14,27 +14,49 @@ from app.core.fare_calculator import calculate_fare
 from app.core.eta import calculate_eta_minutes
 from app.core.trip_state_machine import is_valid_transition
 from app.core.location_throttle import clear_trip_tracking
+from app.core.auth_deps import get_current_driver, get_current_rider, get_current_principal
+from app.core.rate_limit import check_rate_limit
 from app.websocket.manager import driver_manager, rider_manager
 from app.websocket.events import ride_assigned_event, driver_found_event, trip_status_updated_event
 
 router = APIRouter(prefix="/rides", tags=["trips"])
 
 
+def _require_trip_participant(trip: Trip, current_driver: Driver = None, current_rider: Rider = None):
+    """
+    Ownership check for trip-scoped actions: the caller must be either
+    the driver OR the rider actually on this specific trip — not just
+    any authenticated user. Without this, any logged-in rider could
+    mark ANY trip completed, or read ANY trip's route, not just their own.
+    """
+    if current_driver and str(trip.driver_id) == str(current_driver.id):
+        return
+    if current_rider and str(trip.rider_id) == str(current_rider.id):
+        return
+    raise HTTPException(status_code=403, detail="Not a participant on this trip")
+
+
 @router.post("/request", response_model=TripOut)
-async def request_ride(ride_in: RideRequest, db: Session = Depends(get_db)):
+async def request_ride(
+    ride_in: RideRequest,
+    db: Session = Depends(get_db),
+    current_rider: Rider = Depends(get_current_rider),
+):
     """
-    The core matching flow:
-      1. Confirm the rider is real (Postgres read).
-      2. Ask the matching engine for the closest available driver
-         (Redis GEOSEARCH -> Postgres availability filter).
-      3. Write the Trip row to Postgres — THIS is the exact moment the
-         match becomes durable. Before this line, it's just a value in
-         memory; after it, it survives a crash/restart.
-      4. Push live notifications over WebSocket to both parties, if
-         they're currently connected. This is a best-effort side effect —
-         the trip is already durably saved regardless of whether either
-         push actually reaches anyone.
+    The core matching flow. NOW REQUIRES RIDER AUTH: the caller must be
+    logged in as the exact rider_id being requested for — without this,
+    any authenticated rider could request rides on behalf of another
+    rider's account (and have THEIR payment method/history attached).
     """
+    if str(current_rider.id) != str(ride_in.rider_id):
+        raise HTTPException(status_code=403, detail="Cannot request a ride on behalf of another rider")
+
+    # Ride requests are a legitimately rare action (a few per hour at
+    # most for any real rider) -- max 5 per 60 sec is generous headroom
+    # for retries/misclicks while still blocking a scripted spam attack
+    # that could otherwise flood the matching engine with fake requests.
+    check_rate_limit(f"ratelimit:ride_request:{ride_in.rider_id}", max_requests=5, window_seconds=60)
+
     rider = db.query(Rider).filter(Rider.id == ride_in.rider_id).first()
     if not rider:
         raise HTTPException(status_code=404, detail="Rider not found")
@@ -93,23 +115,30 @@ async def request_ride(ride_in: RideRequest, db: Session = Depends(get_db)):
 
 
 @router.patch("/{trip_id}/status", response_model=TripOut)
-async def update_trip_status(trip_id: uuid.UUID, update: TripStatusUpdate, db: Session = Depends(get_db)):
+async def update_trip_status(
+    trip_id: uuid.UUID,
+    update: TripStatusUpdate,
+    db: Session = Depends(get_db),
+    principal=Depends(get_current_principal),
+):
     """
-    Transitions a trip to a new status, enforcing the state machine —
-    e.g. a COMPLETED trip can never move to any other status, and a
-    REQUESTED trip can't jump straight to COMPLETED without going
-    through ONGOING and PAYMENT_PENDING first.
+    Transitions a trip to a new status, enforcing the state machine.
+    NOW REQUIRES AUTH: caller must be either the driver or rider actually
+    ON this trip — not just any authenticated user. A stranger with a
+    valid token should never be able to mark someone else's trip
+    completed or cancel it.
+    """
+    role, user = principal
 
-    Side effect: when a trip becomes ONGOING, the driver is busy with
-    this specific rider, so is_available flips to False. The driver
-    STAYS unavailable through PAYMENT_PENDING (the ride physically ended,
-    but payment hasn't settled yet — mirrors real ride-hailing apps,
-    where a driver isn't freed until payment is confirmed, not the
-    instant the ride ends). Only COMPLETED or CANCELLED frees the driver.
-    """
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+
+    _require_trip_participant(
+        trip,
+        current_driver=user if role == "driver" else None,
+        current_rider=user if role == "rider" else None,
+    )
 
     if not is_valid_transition(trip.status, update.new_status):
         raise HTTPException(
@@ -138,28 +167,37 @@ async def update_trip_status(trip_id: uuid.UUID, update: TripStatusUpdate, db: S
 
 
 @router.get("/{trip_id}", response_model=TripOut)
-def get_trip(trip_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_trip(trip_id: uuid.UUID, db: Session = Depends(get_db), principal=Depends(get_current_principal)):
     """
-    Fallback lookup path for a single trip's current state — useful if a
-    rider/driver's app wasn't connected via WebSocket when a push
-    happened (pushes are best-effort, established in Phase 3), so they
-    can just ask directly instead of waiting for one that already passed.
+    Fallback lookup path for a single trip's current state. NOW REQUIRES
+    AUTH + participant check — a trip's fare, pickup location, and
+    status are private to the two people involved in it.
     """
+    role, user = principal
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+    _require_trip_participant(
+        trip,
+        current_driver=user if role == "driver" else None,
+        current_rider=user if role == "rider" else None,
+    )
     return trip
 
 
 @router.get("/history/{rider_id}", response_model=list[TripOut])
-def get_trip_history(rider_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_trip_history(
+    rider_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_rider: Rider = Depends(get_current_rider),
+):
     """
-    All past trips for a rider, most recent first. Kept unpaginated for
-    now — fine at small scale, but a rider with thousands of trips would
-    need cursor-based pagination here in a real system, not offset-based
-    (offset pagination degrades badly at large offsets since the database
-    still has to scan and discard all skipped rows).
+    All past trips for a rider. NOW REQUIRES RIDER AUTH + ownership — a
+    rider can only view their OWN trip history, never another rider's.
     """
+    if str(current_rider.id) != str(rider_id):
+        raise HTTPException(status_code=403, detail="Cannot view another rider's trip history")
+
     trips = (
         db.query(Trip)
         .filter(Trip.rider_id == rider_id)
@@ -170,15 +208,21 @@ def get_trip_history(rider_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{trip_id}/route")
-def get_trip_route(trip_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_trip_route(trip_id: uuid.UUID, db: Session = Depends(get_db), principal=Depends(get_current_principal)):
     """
-    Full recorded path for a trip, in chronological order — the data
-    needed to draw/replay the actual route driven, distinct from the
-    single current position Redis holds while a trip is live.
+    Full recorded path for a trip. NOW REQUIRES AUTH + participant check
+    — route history is exactly the kind of data (where someone actually
+    went) that must never be readable by an arbitrary authenticated user.
     """
+    role, user = principal
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+    _require_trip_participant(
+        trip,
+        current_driver=user if role == "driver" else None,
+        current_rider=user if role == "rider" else None,
+    )
 
     points = (
         db.query(TripLocationLog)

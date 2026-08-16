@@ -7,6 +7,8 @@ from app.models.trip_location_log import TripLocationLog
 from app.schemas.driver import DriverCreate, DriverOut, LocationUpdate
 from app.core.geo_utils import update_driver_location
 from app.core.location_throttle import should_push_location
+from app.core.auth_deps import get_current_driver
+from app.core.rate_limit import check_rate_limit
 from app.routers.trips import find_active_trip_for_driver
 from app.websocket.manager import rider_manager
 from app.websocket.events import driver_location_update_event
@@ -14,12 +16,26 @@ from app.websocket.events import driver_location_update_event
 router = APIRouter(prefix="/drivers", tags=["drivers"])
 
 
+def _require_self(driver_id: str, current_driver: Driver):
+    """
+    Ownership check: the authenticated driver must BE the driver_id in
+    the URL. Without this, any logged-in driver could report location,
+    go online/offline, etc. AS a different driver — authentication alone
+    (proving who you are) isn't authorization (proving you're allowed to
+    act on this specific resource). Both checks are required.
+    """
+    if str(current_driver.id) != str(driver_id):
+        raise HTTPException(status_code=403, detail="Cannot act on behalf of another driver")
+
+
 @router.post("/register", response_model=DriverOut)
 def register_driver(driver_in: DriverCreate, db: Session = Depends(get_db)):
     """
-    Writes a new driver into Postgres — the durable 'register book' entry.
-    This does NOT touch Redis at all; location is reported separately,
-    only once the driver actually goes online.
+    LEGACY endpoint from before auth existed — creates a driver with no
+    password, unusable for login. Kept only so nothing that referenced it
+    earlier in this project breaks. New drivers should use
+    POST /auth/driver/signup instead, which sets a password and returns
+    a usable token immediately.
     """
     existing = db.query(Driver).filter(Driver.phone_number == driver_in.phone_number).first()
     if existing:
@@ -38,20 +54,29 @@ def register_driver(driver_in: DriverCreate, db: Session = Depends(get_db)):
 
 
 @router.post("/{driver_id}/location")
-async def report_location(driver_id: str, location: LocationUpdate, db: Session = Depends(get_db)):
+async def report_location(
+    driver_id: str,
+    location: LocationUpdate,
+    db: Session = Depends(get_db),
+    current_driver: Driver = Depends(get_current_driver),
+):
     """
     Called repeatedly (every 2-5 sec) by a driver's app to report their
     current position. Writes ONLY to Redis — never to Postgres.
 
-    We still check Postgres to confirm the driver_id is a real, registered
-    driver — a cheap lookup, not a write, so it doesn't carry the write-
-    amplification cost we're avoiding.
-
-    NEW in Phase 6: if this driver currently has an ONGOING trip, also
-    push their location live to that trip's rider — this is the actual
-    "moving car icon on a map" mechanism. Every other part of this
-    function is unchanged from Phase 1; this is purely additive.
+    NOW REQUIRES AUTH: the caller must be logged in AS this exact driver.
+    Without this, anyone could spoof any driver's location by just
+    guessing/knowing their UUID — a real integrity problem, since
+    matching decisions and fare/ETA all depend on this data being honest.
     """
+    _require_self(driver_id, current_driver)
+
+    # Location pings are expected every 2-5 sec normally -- this limit
+    # (max 20 per 10 sec) catches a malfunctioning/malicious client
+    # spamming far above realistic GPS frequency, without interfering
+    # with normal usage.
+    check_rate_limit(f"ratelimit:location:{driver_id}", max_requests=20, window_seconds=10)
+
     driver = db.query(Driver).filter(Driver.id == driver_id).first()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
@@ -83,19 +108,14 @@ async def report_location(driver_id: str, location: LocationUpdate, db: Session 
 
 
 @router.post("/{driver_id}/go-online", response_model=DriverOut)
-def go_online(driver_id: str, db: Session = Depends(get_db)):
+def go_online(driver_id: str, db: Session = Depends(get_db), current_driver: Driver = Depends(get_current_driver)):
     """
     The real mechanism a driver's app calls when they tap 'Go Online'.
-    This is the actual replacement for every manual psql UPDATE we ran
-    during testing — same effect, triggered by a real request instead of
-    hand-typed SQL.
-
-    NOTE: this only flips availability in Postgres. It deliberately does
-    NOT touch Redis — a driver could go online here but never report a
-    location, in which case GEOSEARCH simply won't find them (correct
-    behavior: no location means no way to know they're nearby, regardless
-    of their availability flag).
+    NOW REQUIRES AUTH + ownership — a driver can only toggle their own
+    availability, never another driver's.
     """
+    _require_self(driver_id, current_driver)
+
     driver = db.query(Driver).filter(Driver.id == driver_id).first()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
@@ -107,15 +127,9 @@ def go_online(driver_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{driver_id}/go-offline", response_model=DriverOut)
-def go_offline(driver_id: str, db: Session = Depends(get_db)):
-    """
-    The counterpart to go-online. Note this does NOT delete the driver's
-    Redis location — their last known position simply stays there,
-    unused, until it's naturally overwritten by their next location
-    report whenever they reconnect. GEOSEARCH would still technically
-    find them geographically, but the is_available=False check in
-    find_best_available_driver correctly filters them out regardless.
-    """
+def go_offline(driver_id: str, db: Session = Depends(get_db), current_driver: Driver = Depends(get_current_driver)):
+    _require_self(driver_id, current_driver)
+
     driver = db.query(Driver).filter(Driver.id == driver_id).first()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
